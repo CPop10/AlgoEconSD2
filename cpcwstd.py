@@ -1,13 +1,14 @@
 #!/usr/bin/python
 
-# This is a dummy peer that just illustrates the available information your peers 
-# have available.
-
-# You'll want to copy this file to AgentNameXXX.py for various versions of XXX,
-# probably get rid of the silly logging messages, and then add more logic.
+# BitTorrent client implementing the reference protocol:
+# - Rarest-first piece selection
+# - Rate-based choking algorithm (leecher state)
+# - Optimistic unchoking every 3 rounds
+# - Equal bandwidth split across m=4 upload slots
 
 import random
 import logging
+from collections import defaultdict
 
 from messages import Upload, Request
 from util import even_split
@@ -16,95 +17,221 @@ from peer import Peer
 class CpcwStd(Peer):
     def post_init(self):
         print(("post_init(): %s here!" % self.id))
-        self.dummy_state = dict()
-        self.dummy_state["cake"] = "lie"
-    
+        
+        # State for choking algorithm
+        
+        self.optimistic_unchoke_peer = None  # Current optimistic peer
+        self.unchoked_peers = []  # Currently unchoked peers
+        self.num_upload_slots = 4  # m = 4 as per protocol
+        
+
     def requests(self, peers, history):
         """
-        peers: available info about the peers (who has what pieces)
-        history: what's happened so far as far as this peer can see
-
-        returns: a list of Request() objects
-
-        This will be called after update_pieces() with the most recent state.
+        Implements rarest-first piece selection algorithm.
+        Prioritizes requesting pieces that are least common across peers.
         """
         needed = lambda i: self.pieces[i] < self.conf.blocks_per_piece
         needed_pieces = list(filter(needed, list(range(len(self.pieces)))))
-        np_set = set(needed_pieces)  # sets support fast intersection ops.
-
-
-        logging.debug("%s here: still need pieces %s" % (
-            self.id, needed_pieces))
-
-        logging.debug("%s still here. Here are some peers:" % self.id)
-        for p in peers:
-            logging.debug("id: %s, available pieces: %s" % (p.id, p.available_pieces))
-
-        logging.debug("And look, I have my entire history available too:")
-        logging.debug("look at the AgentHistory class in history.py for details")
-        logging.debug(str(history))
-
-        requests = []   # We'll put all the things we want here
-        # Symmetry breaking is good...
-        random.shuffle(needed_pieces)
         
-        # Sort peers by id.  This is probably not a useful sort, but other 
-        # sorts might be useful
-        peers.sort(key=lambda p: p.id)
-        # request all available pieces from all peers!
-        # (up to self.max_requests from each)
+        if len(needed_pieces) == 0:
+            return []  # We have everything!
+
+        logging.debug("%s here: still need pieces %s" % (self.id, needed_pieces))
+
+        
+        # Sort pieces by rarity (rarest first)
+        sorted_needed = self._sort_pieces_by_rarity(needed_pieces, peers)
+        
+        requests = []
+        
+        # Request rarest pieces from each peer
         for peer in peers:
             av_set = set(peer.available_pieces)
+            np_set = set(sorted_needed)
             isect = av_set.intersection(np_set)
-            n = min(self.max_requests, len(isect))
-            # More symmetry breaking -- ask for random pieces.
-            # This would be the place to try fancier piece-requesting strategies
-            # to avoid getting the same thing from multiple peers at a time.
-            for piece_id in random.sample(sorted(isect), n):
-                # aha! The peer has this piece! Request it.
-                # which part of the piece do we need next?
-                # (must get the next-needed blocks in order)
+            
+            if len(isect) == 0:
+                continue  # Peer has nothing we need
+            
+            # Pick rarest pieces this peer has (maintain rarity order)
+            pieces_to_request = []
+            for piece_id in sorted_needed:
+                if piece_id in isect:
+                    pieces_to_request.append(piece_id)
+                    if len(pieces_to_request) >= self.max_requests:
+                        break
+            
+            # Create requests
+            for piece_id in pieces_to_request:
                 start_block = self.pieces[piece_id]
                 r = Request(self.id, peer.id, piece_id, start_block)
                 requests.append(r)
-
+        
         return requests
 
     def uploads(self, requests, peers, history):
         """
-        requests -- a list of the requests for this peer for this round
-        peers -- available info about all the peers
-        history -- history for all previous rounds
-
-        returns: list of Upload objects.
-
-        In each round, this will be called after requests().
+        Implements the reference choking algorithm:
+        - Select top (m-1) peers by download rate for regular unchoking
+        - Every 3 rounds, randomly select one peer for optimistic unchoking
+        - Split bandwidth equally among all m unchoked peers
+        
+        Edge cases handled:
+        - No interested peers (empty requests)
+        - Round 0 (no download history)
+        - Fewer than m interested peers
+        - All peers have zero download rate
+        - Empty unchoked list after selection
         """
-
         round = history.current_round()
-        logging.debug("%s again.  It's round %d." % (
-            self.id, round))
-        # One could look at other stuff in the history too here.
-        # For example, history.downloads[round-1] (if round != 0, of course)
-        # has a list of Download objects for each Download to this peer in
-        # the previous round.
-
+        logging.debug("%s again. It's round %d." % (self.id, round))
+        
+        # Handle case where no one wants our pieces
         if len(requests) == 0:
             logging.debug("No one wants my pieces!")
-            chosen = []
-            bws = []
-        else:
-            logging.debug("Still here: uploading to a random peer")
-            # change my internal state for no reason
-            self.dummy_state["cake"] = "pie"
-
-            request = random.choice(requests)
-            chosen = [request.requester_id]
-            # Evenly "split" my upload bandwidth among the one chosen requester
-            bws = even_split(self.up_bw, len(chosen))
-
-        # create actual uploads out of the list of peer ids and bandwidths
-        uploads = [Upload(self.id, peer_id, bw)
-                   for (peer_id, bw) in zip(chosen, bws)]
             
+            return []
+        
+        # Get list of interested peer IDs
+        interested_peers = self._get_interested_peer_ids(requests)
+        
+        # Calculate download rates from recent history
+        download_rates = self._get_download_rates(history, round)
+        
+        # Select top (m-1) peers by download rate for regular unchoking
+        regular_unchoked = self._select_unchoked_peers(
+            interested_peers, 
+            download_rates
+        )
+        
+        # Handle optimistic unchoking (every 3 rounds)
+        if self._should_update_optimistic(history):
+            # Select new random optimistic peer
+            self.optimistic_unchoke_peer = self._select_optimistic_unchoke(
+                interested_peers,
+                regular_unchoked
+            )
+            
+        
+        # Increment round counter
+        
+        # Combine regular + optimistic for final unchoked list
+        unchoked = regular_unchoked.copy()
+        if self.optimistic_unchoke_peer is not None:
+            unchoked.append(self.optimistic_unchoke_peer)
+        
+        # EDGE CASE: If no peers can be unchoked (early rounds, no history)
+        # Fall back to random selection from interested peers (up to m slots)
+        if len(unchoked) == 0:
+            logging.debug("No peers selected by algorithm (likely round 0), using random selection")
+            num_to_unchoke = min(self.num_upload_slots, len(interested_peers))
+            unchoked = random.sample(interested_peers, num_to_unchoke)
+            self.optimistic_unchoke_peer = None  # No specific optimistic in this case
+        
+        # Store for tracking
+        self.unchoked_peers = unchoked
+        
+        logging.debug("Unchoked peers: %s (regular: %s, optimistic: %s)" % 
+                     (unchoked, regular_unchoked, self.optimistic_unchoke_peer))
+        
+        # Split bandwidth equally among all unchoked peers
+        bws = even_split(self.up_bw, len(unchoked))
+        
+        # Create Upload objects
+        uploads = [Upload(self.id, peer_id, bw)
+                   for (peer_id, bw) in zip(unchoked, bws)]
+        
         return uploads
+    
+    # =========================================================================
+    # Helper methods
+    # =========================================================================
+    
+   
+    
+    def _sort_pieces_by_rarity(self, needed_pieces, peers):
+
+        """Calculate how many peers have each piece."""
+        rarity_dic = defaultdict(int)
+        
+        for piece_id in needed_pieces:
+            for peer in peers:
+                if piece_id in peer.available_pieces:
+                    rarity_dic[piece_id] += 1
+        
+        
+        """Sort pieces by rarity (least common first), break ties randomly."""
+        pieces_with_rarity = []
+        for piece_id in needed_pieces:
+            rarity = rarity_dic.get(piece_id, float('inf'))
+            pieces_with_rarity.append((piece_id, rarity, random.random()))
+        
+        # Sort by rarity (ascending), then random for tie-breaking
+        pieces_with_rarity.sort(key=lambda x: (x[1], x[2]))
+        
+        return [piece_id for piece_id, _, _ in pieces_with_rarity]
+    
+    def _get_download_rates(self, history, current_round, window_rounds=2):
+        """Calculate average download rate from each peer over last 2 rounds (20 seconds)."""
+        rates = defaultdict(float)
+        
+        if current_round == 0:
+            return dict(rates)
+        
+        # Look back over last 2 rounds
+        start_round = max(0, current_round - window_rounds)
+        total_blocks = defaultdict(int)
+        
+        # Sum blocks received from each peer
+        for round_num in range(start_round, current_round):
+            if round_num in history.downloads:
+                for download in history.downloads[round_num]:
+                    total_blocks[download.from_id] += download.blocks
+        
+        # Calculate rate (blocks per second)
+        # Assuming 10 seconds per round
+        total_seconds = window_rounds * 10
+        
+        for peer_id, blocks in total_blocks.items():
+            if total_seconds > 0:
+                rates[peer_id] = blocks / total_seconds
+        
+        return dict(rates)
+    
+    def _select_unchoked_peers(self, interested_peers, download_rates):
+        """Select top (m-1) peers by download rate."""
+        # Filter to peers with positive rates
+        peers_with_rates = []
+        for peer_id in interested_peers:
+            if peer_id in download_rates and download_rates[peer_id] > 0:
+                peers_with_rates.append((peer_id, download_rates[peer_id]))
+        
+        # Sort by rate (descending), break ties randomly
+        peers_with_rates = [(peer_id, rate, random.random()) 
+                            for peer_id, rate in peers_with_rates]
+        peers_with_rates.sort(key=lambda x: (x[1], x[2]), reverse=True)
+        
+        # Select top (m-1) peers
+        num_to_select = min(self.num_upload_slots - 1, len(peers_with_rates))
+        selected = [peer_id for peer_id, rate, _ in peers_with_rates[:num_to_select]]
+        
+        return selected
+    
+    def _select_optimistic_unchoke(self, interested_peers, currently_unchoked):
+        """Select random peer for optimistic unchoking (excluding already unchoked)."""
+        unchoked_set = set(currently_unchoked)
+        candidates = [peer_id for peer_id in interested_peers 
+                      if peer_id not in unchoked_set]
+        
+        if len(candidates) == 0:
+            return None
+        
+        return random.choice(candidates)
+    
+    def _should_update_optimistic(self,history):
+        """Check if we should select new optimistic peer (every 3 rounds)."""
+        return history.current_round() % 3 == 0 
+    
+    def _get_interested_peer_ids(self, requests):
+        """Extract unique peer IDs from requests list."""
+        return list(set([request.requester_id for request in requests]))

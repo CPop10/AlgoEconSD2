@@ -18,6 +18,7 @@ class CpcwPropShare(Peer):
         print(("post_init(): %s here!" % self.id))
         self.dummy_state = dict()
         self.dummy_state["cake"] = "lie"
+
     
     def requests(self, peers, history):
         """
