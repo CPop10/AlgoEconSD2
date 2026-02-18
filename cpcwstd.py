@@ -43,29 +43,30 @@ class CpcwStd(Peer):
         sorted_needed = self._sort_pieces_by_rarity(needed_pieces, peers)
         
         requests = []
+        requested_pieces = set()
+
+        # Symmetry breaking helps avoid all peers making identical choices.
+        peers_shuffled = peers[:]
+        random.shuffle(peers_shuffled)
         
-        # Request rarest pieces from each peer
-        for peer in peers:
+        # Request rarest pieces first, but avoid duplicate piece requests in a round.
+        for peer in peers_shuffled:
             av_set = set(peer.available_pieces)
-            np_set = set(sorted_needed)
-            isect = av_set.intersection(np_set)
-            
-            if len(isect) == 0:
-                continue  # Peer has nothing we need
-            
-            # Pick rarest pieces this peer has (maintain rarity order)
             pieces_to_request = []
+
             for piece_id in sorted_needed:
-                if piece_id in isect:
+                if piece_id in av_set and piece_id not in requested_pieces:
                     pieces_to_request.append(piece_id)
                     if len(pieces_to_request) >= self.max_requests:
                         break
             
-            # Create requests
             for piece_id in pieces_to_request:
                 start_block = self.pieces[piece_id]
-                r = Request(self.id, peer.id, piece_id, start_block)
-                requests.append(r)
+                requests.append(Request(self.id, peer.id, piece_id, start_block))
+                requested_pieces.add(piece_id)
+
+            if len(requested_pieces) == len(needed_pieces):
+                break
         
         return requests
 
@@ -104,20 +105,21 @@ class CpcwStd(Peer):
             download_rates
         )
         
-        # Handle optimistic unchoking (every 3 rounds)
-        if self._should_update_optimistic(history):
-            # Select new random optimistic peer
+        # Refresh optimistic peer periodically, or when stale/duplicated.
+        should_refresh_optimistic = (
+            self._should_update_optimistic(history) or
+            self.optimistic_unchoke_peer not in interested_peers or
+            self.optimistic_unchoke_peer in regular_unchoked
+        )
+        if should_refresh_optimistic:
             self.optimistic_unchoke_peer = self._select_optimistic_unchoke(
                 interested_peers,
                 regular_unchoked
             )
-            
-        
-        # Increment round counter
         
         # Combine regular + optimistic for final unchoked list
         unchoked = regular_unchoked.copy()
-        if self.optimistic_unchoke_peer is not None:
+        if self.optimistic_unchoke_peer is not None and self.optimistic_unchoke_peer not in unchoked:
             unchoked.append(self.optimistic_unchoke_peer)
         
         # EDGE CASE: If no peers can be unchoked (early rounds, no history)
@@ -181,16 +183,16 @@ class CpcwStd(Peer):
         # Look back over last 2 rounds
         start_round = max(0, current_round - window_rounds)
         total_blocks = defaultdict(int)
+        rounds_considered = history.downloads[start_round:current_round]
         
         # Sum blocks received from each peer
-        for round_num in range(start_round, current_round):
-            if round_num in history.downloads:
-                for download in history.downloads[round_num]:
-                    total_blocks[download.from_id] += download.blocks
+        for round_downloads in rounds_considered:
+            for download in round_downloads:
+                total_blocks[download.from_id] += download.blocks
         
         # Calculate rate (blocks per second)
         # Assuming 10 seconds per round
-        total_seconds = window_rounds * 10
+        total_seconds = max(1, len(rounds_considered)) * 10
         
         for peer_id, blocks in total_blocks.items():
             if total_seconds > 0:
@@ -200,15 +202,12 @@ class CpcwStd(Peer):
     
     def _select_unchoked_peers(self, interested_peers, download_rates):
         """Select top (m-1) peers by download rate."""
-        # Filter to peers with positive rates
-        peers_with_rates = []
-        for peer_id in interested_peers:
-            if peer_id in download_rates and download_rates[peer_id] > 0:
-                peers_with_rates.append((peer_id, download_rates[peer_id]))
+        peers_with_rates = [
+            (peer_id, download_rates.get(peer_id, 0.0), random.random())
+            for peer_id in interested_peers
+        ]
         
         # Sort by rate (descending), break ties randomly
-        peers_with_rates = [(peer_id, rate, random.random()) 
-                            for peer_id, rate in peers_with_rates]
         peers_with_rates.sort(key=lambda x: (x[1], x[2]), reverse=True)
         
         # Select top (m-1) peers
