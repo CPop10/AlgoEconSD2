@@ -1,4 +1,4 @@
-#!/usr/bin/python
+# ChatGPT was used to help guide our implementation. We acknowledge this per the course syllabus' LLM policy and take full responsibility for all written code. 
 
 import random
 import logging
@@ -98,9 +98,8 @@ class CpcwTyrant(Peer):
         uploads = [Upload(self.id, peer_id, bw) for peer_id, bw in allocations.items()]
         return uploads
 
-    # =========================================================================
-    # Helper methods
-    # =========================================================================
+    # -------------- helpers --------------
+
 
     def sort_pieces_by_rarity(self, needed_pieces, peers):
         rarity = defaultdict(int)
@@ -116,32 +115,28 @@ class CpcwTyrant(Peer):
         pieces_with_rarity.sort(key=lambda x: (x[1], x[2]))
         return [piece_id for piece_id, _, _ in pieces_with_rarity]
 
-    def get_interested_peer_ids(self, requests):
+    def get_interested_peer_ids(self, requests): # extract unique peer IDs from requests to identify which peers are interested in our pieces
         return list(set([request.requester_id for request in requests]))
 
-    def ensure_peer_state(self, peer_ids):
+    def ensure_peer_state(self, peer_ids): # make sure we have state entries for all interested peers
         for peer_id in peer_ids:
             if peer_id not in self.peer_upload_cost:
                 self.peer_upload_cost[peer_id] = self.initial_upload_guess
             if peer_id not in self.peer_download_est:
                 self.peer_download_est[peer_id] = 1.0
 
-    def get_last_round_downloads(self, history):
+    def get_last_round_downloads(self, history): # calculate total blocks downloaded from each peer in the last round
         downloads = defaultdict(int)
         if history.current_round() == 0:
             return downloads
-
         for d in history.downloads[-1]:
             downloads[d.from_id] += d.blocks
         return downloads
 
-    def update_download_estimates(self, observed_downloads):
-        # Decay stale estimates to avoid overrating peers who stop reciprocating.
+    def update_download_estimates(self, observed_downloads): # decay estimates for peers that didn't upload to us, update estimates for peers that did with a weighted average
         for peer_id in list(self.peer_download_est.keys()):
             if peer_id not in observed_downloads:
                 self.peer_download_est[peer_id] *= 0.8
-
-        # Exponential moving average for smoother per-peer value.
         for peer_id, blocks in observed_downloads.items():
             prev = self.peer_download_est.get(peer_id, float(blocks))
             self.peer_download_est[peer_id] = 0.7 * prev + 0.3 * blocks
@@ -161,14 +156,12 @@ class CpcwTyrant(Peer):
             est_cost = max(self.min_upload_bw, self.peer_upload_cost.get(peer_id, self.initial_upload_guess))
             score = est_download / est_cost
             ranked.append((peer_id, score, est_cost, est_download, random.random()))
-
         ranked.sort(key=lambda x: (x[1], x[3], x[4]), reverse=True)
         return ranked
 
-    def allocate_bandwidth(self, ranked_peers):
+    def allocate_bandwidth(self, ranked_peers): # greedily allocate upload bandwidth to top peers by score until run out of bandwidth or peers
         remaining = int(self.up_bw)
         allocations = {}
-
         for peer_id, _, est_cost, _, _ in ranked_peers:
             bw = int(max(self.min_upload_bw, round(est_cost)))
             if bw <= remaining:
@@ -176,32 +169,19 @@ class CpcwTyrant(Peer):
                 remaining -= bw
             if remaining <= 0:
                 break
-
         if len(allocations) == 0 and len(ranked_peers) > 0:
             allocations[ranked_peers[0][0]] = int(self.up_bw)
-
         return allocations
 
-    def add_optimistic_peer(self, allocations, interested_peers, current_round):
+    def add_optimistic_peer(self, allocations, interested_peers, current_round): # periodically add an optimistic peer if we have spare bandwidth and it's time to refresh
         if current_round % self.optimistic_period != 0:
             return
-
         remaining = int(self.up_bw) - sum(allocations.values())
         if remaining <= 0:
             return
-
         candidates = [p for p in interested_peers if p not in allocations]
         if len(candidates) == 0:
             return
-
         peer_id = random.choice(candidates)
-        bw = int(
-            min(
-                remaining,
-                max(
-                    self.min_upload_bw,
-                    round(self.peer_upload_cost.get(peer_id, self.initial_upload_guess))
-                ),
-            )
-        )
+        bw = int(min(remaining,max(self.min_upload_bw,round(self.peer_upload_cost.get(peer_id, self.initial_upload_guess))),))
         allocations[peer_id] = max(1, bw)

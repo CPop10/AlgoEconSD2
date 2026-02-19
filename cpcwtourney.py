@@ -1,3 +1,5 @@
+# ChatGPT was used to help guide our implementation. We acknowledge this per the course syllabus' LLM policy and take full responsibility for all written code. 
+
 import random
 import logging
 from collections import defaultdict
@@ -67,9 +69,9 @@ class CpcwTourney(Peer):
             return self.uploads_std(requests, history)
         return self.uploads_tyrant(requests, history, aggressive=(phase == "late"))
 
-    # -------------- common helpers --------------
+    # -------------- helpers for all phases --------------
 
-    def phase(self):
+    def phase(self): # determine phase based on progress fraction
         progress = self.progress_fraction()
         if progress < self.early_progress_cutoff:
             return "early"
@@ -77,11 +79,11 @@ class CpcwTourney(Peer):
             return "mid"
         return "late"
 
-    def progress_fraction(self):
+    def progress_fraction(self): # calculate fraction of pieces fully downloaded to determine phase
         completed = sum(1 for blocks in self.pieces if blocks == self.conf.blocks_per_piece)
         return completed / float(self.conf.num_pieces)
 
-    def sort_pieces_by_rarity(self, needed_pieces, peers):
+    def sort_pieces_by_rarity(self, needed_pieces, peers): # calculate rarity of needed pieces and return list sorted by rarity w rarest first, random tie-breaking to avoid bias
         rarity = defaultdict(int)
         for piece_id in needed_pieces:
             for peer in peers:
@@ -95,21 +97,18 @@ class CpcwTourney(Peer):
         pieces_with_rarity.sort(key=lambda x: (x[1], x[2]))
         return [piece_id for piece_id, _, _ in pieces_with_rarity]
 
-    def build_requests(self, peers, sorted_needed, duplicate_limit):
+    def build_requests(self, peers, sorted_needed, duplicate_limit): # build requests with a limit on how many times we request the same piece to balance speed and efficiency, especially in endgame when some pieces may be very rare
         requests = []
         piece_request_counts = defaultdict(int)
         peer_request_counts = defaultdict(int)
         requested_pairs = set()
 
-        # pass 1 requests each piece once if possible, later passes add controlled duplicates.
         for pass_idx in range(duplicate_limit):
             peers_shuffled = peers[:]
             random.shuffle(peers_shuffled)
-
             for peer in peers_shuffled:
                 if peer_request_counts[peer.id] >= self.max_requests:
                     continue
-
                 av_set = set(peer.available_pieces)
                 for piece_id in sorted_needed:
                     if piece_id not in av_set:
@@ -118,7 +117,6 @@ class CpcwTourney(Peer):
                         continue
                     if piece_request_counts[piece_id] >= (pass_idx + 1):
                         continue
-
                     pair = (peer.id, piece_id)
                     if pair in requested_pairs:
                         continue
@@ -134,27 +132,20 @@ class CpcwTourney(Peer):
 
         return requests
 
-    def get_interested_peer_ids(self, requests):
+    def get_interested_peer_ids(self, requests): # extract unique peer IDs from requests to identify which peers are interested in our pieces
         return list(set([request.requester_id for request in requests]))
 
     # -------------- early game standard helpers --------------
 
-    def uploads_std(self, requests, history):
+    def uploads_std(self, requests, history): # standard TFT upload policy
         current_round = history.current_round()
         interested_peers = self.get_interested_peer_ids(requests)
         download_rates = self.get_download_rates(history, current_round)
 
         regular_unchoked = self.select_std_unchoked_peers(interested_peers, download_rates)
-
-        should_refresh_optimistic = (
-            self.should_update_optimistic(current_round) or
-            self.optimistic_unchoke_peer not in interested_peers or
-            self.optimistic_unchoke_peer in regular_unchoked
-        )
+        should_refresh_optimistic = (self.should_update_optimistic(current_round) or self.optimistic_unchoke_peer not in interested_peers or self.optimistic_unchoke_peer in regular_unchoked)
         if should_refresh_optimistic:
-            self.optimistic_unchoke_peer = self.select_optimistic_unchoke(
-                interested_peers, regular_unchoked
-            )
+            self.optimistic_unchoke_peer = self.select_optimistic_unchoke(interested_peers, regular_unchoked)
 
         chosen = regular_unchoked[:]
         if self.optimistic_unchoke_peer is not None and self.optimistic_unchoke_peer not in chosen:
@@ -167,26 +158,23 @@ class CpcwTourney(Peer):
         bws = even_split(int(self.up_bw), len(chosen))
         return [Upload(self.id, peer_id, bw) for peer_id, bw in zip(chosen, bws)]
 
-    def get_download_rates(self, history, current_round, window_rounds=2):
+    def get_download_rates(self, history, current_round, window_rounds=2): # calculate average download rate from each peer over last few rounds to inform TFT decisions
         rates = defaultdict(float)
         if current_round == 0:
             return dict(rates)
-
         start_round = max(0, current_round - window_rounds)
         rounds_considered = history.downloads[start_round:current_round]
         total_blocks = defaultdict(int)
-
         for round_downloads in rounds_considered:
             for download in round_downloads:
                 total_blocks[download.from_id] += download.blocks
-
         total_seconds = max(1, len(rounds_considered)) * 10
         for peer_id, blocks in total_blocks.items():
             rates[peer_id] = blocks / total_seconds
 
         return dict(rates)
 
-    def select_std_unchoked_peers(self, interested_peers, download_rates):
+    def select_std_unchoked_peers(self, interested_peers, download_rates): # select peers to unchoke based on download rates, with random tie-breaking to avoid bias, up to num_upload_slots - 1 to leave room for optimistic unchoke
         peers_with_rates = [
             (peer_id, download_rates.get(peer_id, 0.0), random.random())
             for peer_id in interested_peers
@@ -196,10 +184,10 @@ class CpcwTourney(Peer):
         num_to_select = min(self.num_upload_slots - 1, len(peers_with_rates))
         return [peer_id for peer_id, _, _ in peers_with_rates[:num_to_select]]
 
-    def should_update_optimistic(self, current_round):
+    def should_update_optimistic(self, current_round): # optimistic unchoke every few rounds
         return current_round % 3 == 0
 
-    def select_optimistic_unchoke(self, interested_peers, currently_unchoked):
+    def select_optimistic_unchoke(self, interested_peers, currently_unchoked): # randomly select one peer for optimistic unchoking from interested peers not already unchoked
         candidates = [peer_id for peer_id in interested_peers if peer_id not in set(currently_unchoked)]
         if len(candidates) == 0:
             return None
@@ -207,7 +195,7 @@ class CpcwTourney(Peer):
 
     # -------------- tyrant helpers --------------
 
-    def uploads_tyrant(self, requests, history, aggressive=False):
+    def uploads_tyrant(self, requests, history, aggressive=False): # tyrant style upload policy with bandwidth allocation based on estimated cost and return of uploading to each peer, more aggressive in late phase with more frequent optimistic unchokes and higher adjustments to upload cost estimates
         current_round = history.current_round()
         interested_peers = self.get_interested_peer_ids(requests)
 
@@ -240,14 +228,14 @@ class CpcwTourney(Peer):
         self.last_unchoked_tyrant = set(allocations.keys())
         return [Upload(self.id, peer_id, bw) for peer_id, bw in allocations.items()]
 
-    def ensure_tyrant_peer_state(self, peer_ids):
+    def ensure_tyrant_peer_state(self, peer_ids): # make sure we have state entries for all interested peers in tyrant phase to avoid key errors and have reasonable defaults for new peers, using initial_upload_guess for upload cost and 1.0 for download estimate as a starting point for new peers
         for peer_id in peer_ids:
             if peer_id not in self.peer_upload_cost:
                 self.peer_upload_cost[peer_id] = self.initial_upload_guess
             if peer_id not in self.peer_download_est:
                 self.peer_download_est[peer_id] = 1.0
 
-    def get_last_round_downloads(self, history):
+    def get_last_round_downloads(self, history): # calculate total blocks downloaded from each peer in the last round
         downloads = defaultdict(int)
         if history.current_round() == 0:
             return downloads
@@ -256,7 +244,7 @@ class CpcwTourney(Peer):
             downloads[d.from_id] += d.blocks
         return downloads
 
-    def update_download_estimates(self, observed_downloads, aggressive):
+    def update_download_estimates(self, observed_downloads, aggressive): # decay estimates for peers that didn't upload to us, update estimates for peers that did with a weighted average, more aggressive decay and update in late phase to respond faster to changes in peer behavior
         decay = 0.75 if aggressive else 0.8
         prev_weight = 0.6 if aggressive else 0.7
         new_weight = 1.0 - prev_weight
@@ -269,7 +257,7 @@ class CpcwTourney(Peer):
             prev = self.peer_download_est.get(peer_id, float(blocks))
             self.peer_download_est[peer_id] = prev_weight * prev + new_weight * blocks
 
-    def update_upload_costs(self, observed_downloads, alpha, gamma):
+    def update_upload_costs(self, observed_downloads, alpha, gamma): # update upload cost estimates based on whether peers we unchoked in the last round reciprocated with uploads to us, using alpha for peers that did reciprocate to reduce their estimated cost and gamma for peers that didn't to increase their estimated cost, more aggressive adjustments in late phase to quickly shift bandwidth away from non-reciprocating peers
         for peer_id in self.last_unchoked_tyrant:
             current = self.peer_upload_cost.get(peer_id, self.initial_upload_guess)
             if observed_downloads.get(peer_id, 0) > 0:
@@ -277,18 +265,17 @@ class CpcwTourney(Peer):
             else:
                 self.peer_upload_cost[peer_id] = min(float(self.up_bw), current * gamma)
 
-    def rank_peers(self, interested_peers):
+    def rank_peers(self, interested_peers): # rank peers based on estimated download rate over estimated upload cost
         ranked = []
         for peer_id in interested_peers:
             est_download = self.peer_download_est.get(peer_id, 1.0)
             est_cost = max(self.min_upload_bw, self.peer_upload_cost.get(peer_id, self.initial_upload_guess))
             score = est_download / est_cost
             ranked.append((peer_id, score, est_cost, est_download, random.random()))
-
         ranked.sort(key=lambda x: (x[1], x[3], x[4]), reverse=True)
         return ranked
 
-    def allocate_bandwidth(self, ranked_peers):
+    def allocate_bandwidth(self, ranked_peers): # greedily allocate upload bandwidth to top peers by score until run out of bandwidth or peers, ensuring we allocate at least min_upload_bw to each selected peer and not exceeding our total upload bandwidth
         remaining = int(self.up_bw)
         allocations = {}
 
@@ -302,7 +289,7 @@ class CpcwTourney(Peer):
 
         return allocations, remaining
 
-    def add_optimistic_peer(self, allocations, interested_peers, current_round, remaining, period):
+    def add_optimistic_peer(self, allocations, interested_peers, current_round, remaining, period): # periodically add an optimistic peer if we have spare bandwidth and it's time to refresh
         if current_round % period != 0:
             return remaining
         if remaining <= 0:
@@ -318,7 +305,7 @@ class CpcwTourney(Peer):
         allocations[peer_id] = bw
         return remaining - bw
 
-    def top_allocated_peer(self, ranked_peers, allocations):
+    def top_allocated_peer(self, ranked_peers, allocations): # find the highest ranked peer that we allocated bandwidth to, to give any remaining bandwidth to them, ensuring we maximize the return on our upload bandwidth by giving extra to the peer we expect the most reciprocation from
         for peer_id, _, _, _, _ in ranked_peers:
             if peer_id in allocations:
                 return peer_id
